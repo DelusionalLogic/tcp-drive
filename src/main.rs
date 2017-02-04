@@ -508,7 +508,7 @@ fn main() {
             println!(" {} {}", Red.paint("==>"), err);
             let mut terr : &std::error::Error = &err;
             while let Some(serr) = terr.cause() {
-                println!("    {} {}", Yellow.paint("==>"), err);
+                println!("    {} {}", Yellow.paint("==>"), serr);
                 terr = serr;
             }
         }
@@ -524,7 +524,7 @@ fn main() {
             println!(" {} {}", Red.paint("==>"), err);
             let mut terr : &std::error::Error = &err;
             while let Some(serr) = terr.cause() {
-                println!("    {} {}", Yellow.paint("==>"), err);
+                println!("    {} {}", Yellow.paint("==>"), serr);
                 terr = serr;
             }
         }
