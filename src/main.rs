@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate log;
 extern crate clap;
+extern crate byteorder;
+extern crate ansi_term;
 
 mod network;
 
@@ -10,6 +12,320 @@ use clap::SubCommand;
 use clap::Arg;
 use std::io::BufRead;
 use std::io::{Read, Write};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::error::Error;
+use std::io;
+use std::fmt;
+use ansi_term::Colour::*;
+
+#[derive(Debug)]
+pub enum SerializationError {
+    Io(io::Error),
+    IncompleteRead(usize, usize),
+}
+
+impl fmt::Display for SerializationError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SerializationError::Io(_) => write!(f, "An IO error occured"),
+            SerializationError::IncompleteRead(actual, expected) =>
+                write!(f, "A read didn't get the expected amount of data [Expected {}, Actual {}]", actual, expected),
+        }
+    }
+}
+
+impl Error for SerializationError {
+    fn description(&self) -> &str {
+        match *self {
+            SerializationError::Io(_) => "An I/O error occured during serving",
+            SerializationError::IncompleteRead(_, _) =>
+                "An error occured which caused a read to end before getting the expected data",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            SerializationError::Io(ref err) => Some(err),
+            SerializationError::IncompleteRead(_, _) => None,
+        }
+    }
+}
+
+impl From<io::Error> for SerializationError {
+    fn from(err: io::Error) -> SerializationError {
+        SerializationError::Io(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum FetchError {
+    InvalidTransport(String),
+    FileExists(PathBuf),
+
+    Io(io::Error),
+    Connection(io::Error, std::net::Ipv4Addr, u16),
+    ReadMessage(SerializationError),
+    ReadContent(io::Error),
+    WriteContent(io::Error),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            FetchError::InvalidTransport(ref word) => write!(f, "The transport \"{}\" isn't valid", word),
+            FetchError::FileExists(ref path) => write!(f, "File already exists: {}, that could have been bad", path.to_string_lossy()),
+
+            FetchError::Io(_) => write!(f, "An IO error occured"),
+            FetchError::Connection(_, ip, port) => write!(f, "While connecting to {}:{}", ip, port),
+            FetchError::ReadMessage(_) => write!(f, "While reading file message from network"),
+            FetchError::ReadContent(_) => write!(f, "While reading content of file from network"),
+            FetchError::WriteContent(_) => write!(f, "While writing content of file to disk"),
+        }
+    }
+}
+
+impl Error for FetchError {
+    fn description(&self) -> &str {
+        match *self {
+            FetchError::InvalidTransport(_) => "The given transport was invalid",
+            FetchError::FileExists(_) => "The specified file already exists",
+
+            FetchError::Io(_) => "An I/O error occured during serving",
+            FetchError::Connection(_, _, _) => "A connection error occured",
+            FetchError::ReadMessage(_) => "An error occured while reading the file messages from the network",
+            FetchError::ReadContent(_) => "An error occured while reading the file cotents from the network",
+            FetchError::WriteContent(_) => "An error occured while writing the file cotents to the network",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            FetchError::InvalidTransport(_) => None,
+            FetchError::FileExists(_) => None,
+
+            FetchError::Io(ref err) => Some(err),
+            FetchError::Connection(ref err, _, _) => Some(err),
+            FetchError::ReadMessage(ref err) => Some(err),
+            FetchError::ReadContent(ref err) => Some(err),
+            FetchError::WriteContent(ref err) => Some(err),
+        }
+    }
+}
+
+impl From<io::Error> for FetchError {
+    fn from(err: io::Error) -> FetchError {
+        FetchError::Io(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum SendError {
+    Io(io::Error),
+    Serialization(SerializationError),
+    PathConversion,
+}
+
+impl fmt::Display for SendError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SendError::Io(_) => write!(f, "An IO error occured"),
+            SendError::Serialization(_) => write!(f, "While sending the message"),
+            SendError::PathConversion => write!(f, "Failed converting the path to a string"),
+        }
+    }
+}
+
+impl Error for SendError {
+    fn description(&self) -> &str {
+        match *self {
+            SendError::Io(_) => "An I/O error occured during serving",
+            SendError::Serialization(_) => "An error occured while serializing and sending the message",
+            SendError::PathConversion => "An error occured while converting the path to a string",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            SendError::Io(ref err) => Some(err),
+            SendError::Serialization(ref err) => Some(err),
+            SendError::PathConversion => None,
+        }
+    }
+}
+
+impl From<io::Error> for SendError {
+    fn from(err: io::Error) -> SendError {
+        SendError::Io(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum ServeError {
+    Io(io::Error),
+    Connection(io::Error),
+    Enumeration(network::NetworkError),
+    Bind(io::Error, &'static str, u16), //@Expansion: We might need this to not be a static str
+    SendingFile(SendError),
+}
+
+impl fmt::Display for ServeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            ServeError::Io(_) => write!(f, "An IO error occured"),
+            ServeError::Connection(_) => write!(f, "While processing connection"),
+            ServeError::Enumeration(_) => write!(f, "While enumerating interfaces"),
+            ServeError::Bind(_, ip, port) => write!(f, "While binding to {}:{}", ip, port),
+            ServeError::SendingFile(_) => write!(f, "While sending file"),
+        }
+    }
+}
+
+impl Error for ServeError {
+    fn description(&self) -> &str {
+        match *self {
+            ServeError::Io(_) => "An I/O error occured during serving",
+            ServeError::Connection(_) => "A low level error occured while processing connection",
+            ServeError::Enumeration(_) => "While enumerating interfaces",
+            ServeError::Bind(_, _, _) => "Error while binding connection",
+            ServeError::SendingFile(_) => "Error while sending a file",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            ServeError::Io(ref err) => Some(err),
+            ServeError::Connection(ref err) => Some(err),
+            ServeError::Enumeration(ref err) => Some(err),
+            ServeError::Bind(ref err, _, _) => Some(err),
+            ServeError::SendingFile(ref err) => Some(err),
+        }
+    }
+}
+
+impl From<io::Error> for ServeError {
+    fn from(err: io::Error) -> ServeError {
+        ServeError::Io(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum AppError {
+    Io(io::Error),
+    Serve(ServeError),
+    IncompleteRead(usize, usize),
+    TransportNotFound(String),
+    PathConversion,
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            AppError::Io(_) => write!(f, "An IO error occured"),
+            AppError::Serve(_) => write!(f, "An error occured while serving file"),
+            AppError::IncompleteRead(read, expected) => write!(f, "Incomplete read: read: {}, expected {}", read, expected),
+            AppError::TransportNotFound(ref transport) => write!(f, "The transport \"{}\" isn't valid", transport),
+            AppError::PathConversion => write!(f, "Couldn't convert a path to a string somewhere"),
+        }
+    }
+}
+
+impl Error for AppError {
+    fn description(&self) -> &str {
+        match *self {
+            AppError::Io(ref err) => err.description(),
+            AppError::Serve(_) => "An error occured during file serving",
+            AppError::IncompleteRead(_, _) => "A read didn't read as much as expected",
+            AppError::TransportNotFound(_) => "Failed resolving the transport",
+            AppError::PathConversion => "Couldn't convert a path to a string",
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            AppError::Io(ref err) => Some(err),
+            AppError::Serve(ref err) => Some(err),
+            AppError::IncompleteRead(_, _) => None,
+            AppError::TransportNotFound(_) => None,
+            AppError::PathConversion => None,
+        }
+    }
+}
+
+impl From<io::Error> for AppError {
+    fn from(err: io::Error) -> AppError {
+        AppError::Io(err)
+    }
+}
+
+trait Readn {
+    fn readn(&mut self, buff: &mut Vec<u8>, n: usize) -> std::io::Result<usize>;
+}
+
+impl<T: Read> Readn for T {
+    fn readn(&mut self, mut buff: &mut Vec<u8>, n: usize) -> std::io::Result<usize> {
+        let mut sub = self.take(n as u64);
+        return sub.read_to_end(&mut buff);
+    }
+}
+
+trait Streamable<'a>{
+    fn read<T: Read + 'a>(stream: T) -> Result<Self, SerializationError> where Self: std::marker::Sized;
+    fn write<T: Write + 'a>(&mut self, stream: &mut T) -> Result<usize, SerializationError>;
+}
+
+struct FileMessage<'a> {
+    name_size: u32,
+    name: String,
+    size: u32,
+    file: Box<Read + 'a>,
+}
+
+impl<'a> FileMessage<'a> {
+    fn new<T: Read + 'a>(name: String, size: u32, stream: T) -> Self {
+        return FileMessage {
+            name_size:  name.len() as u32, //@Expansion: 32 bits is a lot, but maybe in the far flung future.
+            name: name,
+            size: size,
+            file: Box::new(stream)
+        };
+    }
+}
+
+impl<'a> Streamable<'a> for FileMessage<'a> {
+    fn read<T: Read + 'a>(mut stream: T) -> Result<Self, SerializationError> {
+        //Get the length of the name
+        let name_len = try!(stream.read_u32::<BigEndian>());
+
+        //Get the name from the stream
+        let mut name_buff = Vec::with_capacity(name_len as usize); //@Expansion: Here we have the 32-bit again.
+        let name_read = try!(stream.readn(&mut name_buff, name_len as usize));
+        if name_len != name_read as u32 {
+            return Err(SerializationError::IncompleteRead(name_read, name_len as usize));
+        }
+        let name = String::from_utf8(name_buff).unwrap(); //@Error: Make error
+
+        //Get the length of the file contents
+        let file_len = try!(stream.read_u32::<BigEndian>()); //@Expansion: u32. That's a direct limit on the size of files.
+                                                             //Currently we aren't aiming at
+                                                             //supporting large files, which makes
+                                                             //it ok.
+        //We aren't getting the file contents because we don't want to store it all in memory
+        return Ok(FileMessage {
+            name_size: name_len,
+            name: name,
+            size: file_len,
+            file: Box::new(stream),
+        });
+    }
+
+    fn write<T: Write + 'a>(&mut self, mut stream: &mut T) -> Result<usize, SerializationError>{
+        try!(stream.write_u32::<BigEndian>(self.name_size)); //@Error: Should this be handled differently?
+        try!(stream.write_all(self.name.as_bytes()));
+        try!(stream.write_u32::<BigEndian>(self.size));
+        try!(std::io::copy(&mut self.file, &mut stream));
+        return Ok(0);
+    }
+}
 
 //@Memory: LARGE
 const WORDS : &'static str = include_str!("words.txt");
@@ -17,7 +333,7 @@ const WORDS : &'static str = include_str!("words.txt");
 //@Performance: Pretty slow
 //@Memory: Probably a big waste
 //@Hack: This should really be in some other datastructure so i wouldn't have to read all of it
-fn read_into_vector(string: &'static str) -> Result<Vec<String>, std::io::Error> {
+fn read_into_vector(string: &'static str) -> Result<Vec<String>, AppError> {
     info!("Reading words into array");
     let cursor = std::io::Cursor::new(string);
     let mut lines = Vec::new();
@@ -32,7 +348,8 @@ type Dict = Vec<String>;
 
 trait Transportable {
     fn make_transport(&self, dict: &Dict) -> String;
-    fn from_transport<S: Into<String>>(dict: &Dict, transport: S) -> Self;
+    fn from_transport<S: Into<String>>(dict: &Dict, transport: S) -> Result<Self, FetchError>
+        where Self: std::marker::Sized;
 }
 
 impl Transportable for std::net::Ipv4Addr {
@@ -46,31 +363,93 @@ impl Transportable for std::net::Ipv4Addr {
         return transport
     }
 
-    fn from_transport<S: Into<String>>(dict: &Dict, transport: S) -> Self {
+    fn from_transport<S: Into<String>>(dict: &Dict, transport: S) -> Result<Self, FetchError> {
         let transport : String = transport.into();
-        let ip_vec = transport
-              .split(" ")
-              .map(| t | dict.binary_search(&t.to_owned()).unwrap() as u32) //@Error: Make error massage
-              .collect::<Vec<u32>>();
+        let mut ip_vec = Vec::new();
 
-        return std::net::Ipv4Addr::from(ip_vec[1] |  ip_vec[0] << 16);
-    }
-}
-
-fn send_file(stream: &mut std::net::TcpStream, path: &PathBuf) {
-    //@Error: This shouldn't happen here
-    let mut file = std::fs::File::open(path).unwrap();
-    let mut buffer = [0u8; 512];
-    //@Error: Improper on file read failed
-    loop{
-        let read = file.read(&mut buffer).expect("Failed reading file");
-        let write = stream.write(&buffer[0..read]).expect("Failed writing to stream");
-        if read == 0 || write == 0 {
-            break;
+        for word in transport.split(" ") {
+            let word = word.to_owned();
+            if let Ok(val) = dict.binary_search(&word) {
+                ip_vec.push(val as u32);
+            } else {
+                return Err(FetchError::InvalidTransport(word));
+            }
         }
+
+        return Ok(std::net::Ipv4Addr::from(ip_vec[1] |  ip_vec[0] << 16));
     }
 }
 
+macro_rules! atry {
+    ($expr:expr, $map:expr) => (
+        try!($expr.map_err($map))
+    );
+}
+
+fn send_file(mut stream: &mut std::net::TcpStream, path: &PathBuf) -> Result<(), SendError> {
+    //@Error: This shouldn't happen here
+    let path_str = try!(path.to_str()
+        .ok_or_else(|| SendError::PathConversion));
+
+    let file = try!(std::fs::File::open(path));
+    let metadata = try!(std::fs::metadata(path));
+
+    let mut message = FileMessage::new(path_str.to_owned(), metadata.len() as u32, file);
+    atry!(message.write(&mut stream), SendError::Serialization);
+    return Ok(());
+}
+
+fn serve_file(lines: &Vec<String>, path: PathBuf, port: u16) -> Result<(), ServeError> {
+        info!("Serving file: \"{}\"", path.to_str().unwrap());
+
+        let interfaces = atry!(network::get_interfaces(), ServeError::Enumeration);
+
+        let listener = atry!(std::net::TcpListener::bind(("0.0.0.0", port)), | err | ServeError::Bind(err, "0.0.0.0", port));
+
+        for interface in &interfaces {
+            println!("{}[{}]\n {} {}",
+                     Green.paint(interface.name.to_string()),
+                     Yellow.paint(interface.addr.to_string()),
+                     Blue.paint("=>"),
+                     interface.addr.make_transport(&lines)
+                    );
+        }
+
+        for conn in listener.incoming() {
+            let mut stream = atry!(conn, ServeError::Connection);
+            atry!(send_file(&mut stream, &path), ServeError::SendingFile);
+        }
+        return Ok(());
+}
+
+fn fetch_file(lines: &Vec<String>, key: String, file: Option<std::path::PathBuf>) ->  Result<(), FetchError> {
+        let ip = try!(std::net::Ipv4Addr::from_transport(&lines, key));
+        println!("{} from ip {}",
+                 Green.paint("Downloading"),
+                 Yellow.paint(ip.to_string()));
+
+        let stream = atry!(std::net::TcpStream::connect((ip, 2222)), | err | FetchError::Connection(err, ip, 2222));//@Expansion: We can't time out right now. Use the net2::TcpBuilder?
+        let mut message = atry!(FileMessage::read(stream), FetchError::ReadMessage);
+
+        let new_path = file
+            .unwrap_or(std::path::PathBuf::from(&message.name));
+
+        if new_path.exists() {
+            return Err(FetchError::FileExists(new_path));
+        }
+
+        let mut file = try!(std::fs::File::create(new_path));
+
+        let mut buffer = [0u8; 512];
+        loop{
+            let read = atry!(message.file.read(&mut buffer), FetchError::ReadContent);
+            if read == 0 {
+                break;
+            }
+            atry!(file.write(&mut buffer[0..read]), FetchError::WriteContent);
+        }
+    return Ok(());
+}
 
 fn main() {
     let matches = App::new("Send")
@@ -98,60 +477,56 @@ fn main() {
                     .arg(Arg::with_name("key")
                          .index(1)
                          .required(true)
+                         .multiple(true)
                          .value_name("KEY")
                          .help("Key of remote file")
+                        )
+                    .arg(Arg::with_name("file")
+                         .short("f")
+                         .long("file")
+                         .value_name("FILE")
+                         .help("Filename of the new file")
                         )
                     ).get_matches();
 
     //@Error: Make error
-    let lines = read_into_vector(WORDS).unwrap();
+    let lines = read_into_vector(WORDS)
+        .unwrap_or_else( | err | panic!("{}", err));
 
     if let Some(matches) = matches.subcommand_matches("serve") {
         //We know that file has to be provided
         let path = PathBuf::from(matches.value_of("file").unwrap());
+
         //@Error: Write something better
         let port : u16 = matches
             .value_of("port")
             .unwrap_or("2222")
             .parse()
             .expect("Failed parsing the port number");
-        info!("Serving file: \"{}\"", path.to_str().unwrap());
 
-        //@Error: Make error
-        let interfaces = network::get_interfaces().unwrap();
-
-        //@Error: Proper errors
-        let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("Hello");
-
-        for interface in &interfaces {
-            println!("Name {}, ip: {}, transport: {}", interface.name, interface.addr, interface.addr.make_transport(&lines));
-        }
-
-        for conn in listener.incoming() {
-            match conn {
-                Ok(mut stream) => send_file(&mut stream, &path),
-                Err(e) => panic!(e),
+        if let Err(err) = serve_file(&lines, path, port) {
+            println!(" {} {}", Red.paint("==>"), err);
+            let mut terr : &std::error::Error = &err;
+            while let Some(serr) = terr.cause() {
+                println!("    {} {}", Yellow.paint("==>"), err);
+                terr = serr;
             }
         }
-    }
+    } else if let Some(matches) = matches.subcommand_matches("fetch") {
+        //There has to be a key for the commandline to be valid so just unwrap
+        let key = matches.values_of("key").unwrap()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let new_path = matches.value_of("file")
+            .map(| path | std::path::PathBuf::from(path));
 
-    if let Some(matches) = matches.subcommand_matches("fetch") {
-        let key = matches.value_of("key").unwrap();
-
-        let ip = std::net::Ipv4Addr::from_transport(&lines, key);
-        println!("Decoded ip {}", ip);
-
-        //@Error: Proper errors
-        let mut stream = std::net::TcpStream::connect((ip, 2222)).expect("Failed to connect");
-        //@Error: Proper errors
-        let mut file = std::fs::File::create("Testfile.txt").unwrap();
-        let mut buffer = [0u8; 512];
-        loop{
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
+        if let Err(err) = fetch_file(&lines, key, new_path) {
+            println!(" {} {}", Red.paint("==>"), err);
+            let mut terr : &std::error::Error = &err;
+            while let Some(serr) = terr.cause() {
+                println!("    {} {}", Yellow.paint("==>"), err);
+                terr = serr;
             }
-            let write = file.write(&mut buffer[0..read]).unwrap();
         }
     }
     return;
