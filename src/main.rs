@@ -3,6 +3,7 @@ extern crate log;
 extern crate clap;
 extern crate byteorder;
 extern crate ansi_term;
+extern crate pbr;
 
 mod network;
 
@@ -17,6 +18,7 @@ use std::error::Error;
 use std::io;
 use std::fmt;
 use ansi_term::Colour::*;
+use pbr::{ProgressBar, Units};
 
 #[derive(Debug)]
 pub enum SerializationError {
@@ -212,9 +214,6 @@ impl From<io::Error> for ServeError {
 pub enum AppError {
     Io(io::Error),
     Serve(ServeError),
-    IncompleteRead(usize, usize),
-    TransportNotFound(String),
-    PathConversion,
 }
 
 impl fmt::Display for AppError {
@@ -222,9 +221,6 @@ impl fmt::Display for AppError {
         match *self {
             AppError::Io(_) => write!(f, "An IO error occured"),
             AppError::Serve(_) => write!(f, "An error occured while serving file"),
-            AppError::IncompleteRead(read, expected) => write!(f, "Incomplete read: read: {}, expected {}", read, expected),
-            AppError::TransportNotFound(ref transport) => write!(f, "The transport \"{}\" isn't valid", transport),
-            AppError::PathConversion => write!(f, "Couldn't convert a path to a string somewhere"),
         }
     }
 }
@@ -234,9 +230,6 @@ impl Error for AppError {
         match *self {
             AppError::Io(ref err) => err.description(),
             AppError::Serve(_) => "An error occured during file serving",
-            AppError::IncompleteRead(_, _) => "A read didn't read as much as expected",
-            AppError::TransportNotFound(_) => "Failed resolving the transport",
-            AppError::PathConversion => "Couldn't convert a path to a string",
         }
     }
 
@@ -244,9 +237,6 @@ impl Error for AppError {
         match *self {
             AppError::Io(ref err) => Some(err),
             AppError::Serve(ref err) => Some(err),
-            AppError::IncompleteRead(_, _) => None,
-            AppError::TransportNotFound(_) => None,
-            AppError::PathConversion => None,
         }
     }
 }
@@ -386,19 +376,25 @@ macro_rules! atry {
     );
 }
 
-fn send_file(mut stream: &mut std::net::TcpStream, path: &PathBuf) -> Result<(), SendError> {
-    //@Error: This shouldn't happen here
-    let path_str = try!(path.to_str()
-        .ok_or_else(|| SendError::PathConversion));
+//@Refactor for @Test: Dont open the file here
+
+fn send_file<S: Write>(mut stream: &mut S, path: &PathBuf) -> Result<(), SendError> {
+    let filename = match path.file_name()
+        .and_then(|x| x.to_str())
+        .map(|x| x.to_owned()) {
+        Some(x) => x,
+        None => return Err(SendError::PathConversion),
+    };
 
     let file = try!(std::fs::File::open(path));
     let metadata = try!(std::fs::metadata(path));
 
-    let mut message = FileMessage::new(path_str.to_owned(), metadata.len() as u32, file);
+    let mut message = FileMessage::new(filename, metadata.len() as u32, file);
     atry!(message.write(&mut stream), SendError::Serialization);
     return Ok(());
 }
 
+//@Refactor: Move file opening and duplicate detection somewhere else?
 fn serve_file(lines: &Vec<String>, path: PathBuf, port: u16) -> Result<(), ServeError> {
         info!("Serving file: \"{}\"", path.to_str().unwrap());
 
@@ -428,8 +424,13 @@ fn fetch_file(lines: &Vec<String>, key: String, file: Option<std::path::PathBuf>
                  Green.paint("Downloading"),
                  Yellow.paint(ip.to_string()));
 
+
+
         let stream = atry!(std::net::TcpStream::connect((ip, 2222)), | err | FetchError::Connection(err, ip, 2222));//@Expansion: We can't time out right now. Use the net2::TcpBuilder?
         let mut message = atry!(FileMessage::read(stream), FetchError::ReadMessage);
+
+        let mut pb = ProgressBar::new(message.size as u64);
+        pb.set_units(Units::Bytes);
 
         let new_path = file
             .unwrap_or(std::path::PathBuf::from(&message.name));
@@ -440,12 +441,13 @@ fn fetch_file(lines: &Vec<String>, key: String, file: Option<std::path::PathBuf>
 
         let mut file = try!(std::fs::File::create(new_path));
 
-        let mut buffer = [0u8; 512];
+        let mut buffer = [0u8; 8192];
         loop{
             let read = atry!(message.file.read(&mut buffer), FetchError::ReadContent);
             if read == 0 {
                 break;
             }
+            pb.add(read as u64);
             atry!(file.write(&mut buffer[0..read]), FetchError::WriteContent);
         }
     return Ok(());
