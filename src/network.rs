@@ -60,7 +60,7 @@ pub struct Interface {
     pub addr : Ipv4Addr,
 }
 
-pub fn get_interfaces() -> Result<Vec<Interface>, NetworkError> {
+pub fn interfaces() -> Result<Vec<Interface>, NetworkError> {
     info!("Getting interfaces");
     let mut interfaces = Vec::new();
     let mut addrs : *mut libc::ifaddrs = unsafe{ mem::uninitialized() };

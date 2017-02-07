@@ -18,6 +18,7 @@ use std::error::Error;
 use std::io;
 use std::fmt;
 use ansi_term::Colour::*;
+use std::cmp::Ordering;
 use pbr::{ProgressBar, Units};
 
 #[derive(Debug)]
@@ -320,10 +321,12 @@ impl<'a> Streamable<'a> for FileMessage<'a> {
 //@Memory: LARGE
 const WORDS : &'static str = include_str!("words.txt");
 
+type Dict = Vec<String>;
+
 //@Performance: Pretty slow
 //@Memory: Probably a big waste
 //@Hack: This should really be in some other datastructure so i wouldn't have to read all of it
-fn read_into_vector(string: &'static str) -> Result<Vec<String>, AppError> {
+fn read_into_vector(string: &'static str) -> Result<Dict, AppError> {
     info!("Reading words into array");
     let cursor = std::io::Cursor::new(string);
     let mut lines = Vec::new();
@@ -334,11 +337,9 @@ fn read_into_vector(string: &'static str) -> Result<Vec<String>, AppError> {
     return Ok(lines);
 }
 
-type Dict = Vec<String>;
-
 trait Transportable {
     fn make_transport(&self, dict: &Dict) -> String;
-    fn from_transport<S: Into<String>>(dict: &Dict, transport: S) -> Result<Self, FetchError>
+    fn from_transport<'a, S: Into<&'a String>>(dict: &Dict, transport: S) -> Result<Self, FetchError>
         where Self: std::marker::Sized;
 }
 
@@ -353,16 +354,22 @@ impl Transportable for std::net::Ipv4Addr {
         return transport
     }
 
-    fn from_transport<S: Into<String>>(dict: &Dict, transport: S) -> Result<Self, FetchError> {
-        let transport : String = transport.into();
+    fn from_transport<'a, S: Into<&'a String>>(dict: &Dict, transport: S) -> Result<Self, FetchError> {
+        let transport : &String = transport.into();
         let mut ip_vec = Vec::new();
 
         for word in transport.split(" ") {
-            let word = word.to_owned();
-            if let Ok(val) = dict.binary_search(&word) {
+            if let Ok(val) = dict.binary_search_by(|p| {
+                    //Flip the search to allow for cmp between String and &str
+                    match word.cmp(p) {
+                        Ordering::Greater => Ordering::Less,
+                        Ordering::Less => Ordering::Greater,
+                        Ordering::Equal => Ordering::Equal,
+                    }
+                }) {
                 ip_vec.push(val as u32);
             } else {
-                return Err(FetchError::InvalidTransport(word));
+                return Err(FetchError::InvalidTransport(word.to_owned()));
             }
         }
 
@@ -394,21 +401,26 @@ fn send_file<S: Write>(mut stream: &mut S, path: &PathBuf) -> Result<(), SendErr
     return Ok(());
 }
 
+fn print_interface(lines: &Dict, interface: &network::Interface) {
+    println!("{}[{}]\n {} {}",
+             Green.paint(interface.name.to_string()),
+             Yellow.paint(interface.addr.to_string()),
+             Blue.paint("=>"),
+             interface.addr.make_transport(&lines)
+            );
+}
+
 //@Refactor: Move file opening and duplicate detection somewhere else?
-fn serve_file(lines: &Vec<String>, path: PathBuf, port: u16) -> Result<(), ServeError> {
+fn serve_file(lines: &Dict, path: PathBuf, port: u16) -> Result<(), ServeError> {
         info!("Serving file: \"{}\"", path.to_str().unwrap());
 
-        let interfaces = atry!(network::get_interfaces(), ServeError::Enumeration);
+        let interfaces = atry!(network::interfaces(), ServeError::Enumeration);
 
         let listener = atry!(std::net::TcpListener::bind(("0.0.0.0", port)), | err | ServeError::Bind(err, "0.0.0.0", port));
 
         for interface in &interfaces {
-            println!("{}[{}]\n {} {}",
-                     Green.paint(interface.name.to_string()),
-                     Yellow.paint(interface.addr.to_string()),
-                     Blue.paint("=>"),
-                     interface.addr.make_transport(&lines)
-                    );
+            info!("Interface: {}", interface.name);
+            print_interface(lines, &interface);
         }
 
         for conn in listener.incoming() {
@@ -418,13 +430,11 @@ fn serve_file(lines: &Vec<String>, path: PathBuf, port: u16) -> Result<(), Serve
         return Ok(());
 }
 
-fn fetch_file(lines: &Vec<String>, key: String, file: Option<std::path::PathBuf>) ->  Result<(), FetchError> {
-        let ip = try!(std::net::Ipv4Addr::from_transport(&lines, key));
+fn fetch_file(lines: &Dict, key: String, file: Option<std::path::PathBuf>) ->  Result<(), FetchError> {
+        let ip = try!(std::net::Ipv4Addr::from_transport(lines, &key));
         println!("{} from ip {}",
                  Green.paint("Downloading"),
                  Yellow.paint(ip.to_string()));
-
-
 
         let stream = atry!(std::net::TcpStream::connect((ip, 2222)), | err | FetchError::Connection(err, ip, 2222));//@Expansion: We can't time out right now. Use the net2::TcpBuilder?
         let mut message = atry!(FileMessage::read(stream), FetchError::ReadMessage);
