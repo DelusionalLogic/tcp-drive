@@ -383,20 +383,39 @@ macro_rules! atry {
     );
 }
 
+struct FileInfo{
+    path: PathBuf,
+    len: u64,
+    stream: std::fs::File,
+}
+
+impl FileInfo {
+    fn new(path: PathBuf, len: u64, stream: std::fs::File) -> FileInfo {
+        return FileInfo {
+            path: path,
+            len: len,
+            stream: stream,
+        }
+    }
+
+    fn from_path(path: PathBuf) -> Result<FileInfo, ServeError> {
+        let file = try!(std::fs::File::open(&path));
+        let metadata = try!(std::fs::metadata(&path));
+        return Ok(FileInfo::new(path, metadata.len(), file))
+    }
+}
+
 //@Refactor for @Test: Dont open the file here
 
-fn send_file<S: Write>(mut stream: &mut S, path: &PathBuf) -> Result<(), SendError> {
-    let filename = match path.file_name()
+fn send_file<S: Write>(mut stream: &mut S, file: &FileInfo) -> Result<(), SendError> {
+    let filename = match file.path.file_name()
         .and_then(|x| x.to_str())
         .map(|x| x.to_owned()) {
         Some(x) => x,
         None => return Err(SendError::PathConversion),
     };
 
-    let file = try!(std::fs::File::open(path));
-    let metadata = try!(std::fs::metadata(path));
-
-    let mut message = FileMessage::new(filename, metadata.len() as u32, file);
+    let mut message = FileMessage::new(filename, file.len as u32, file.stream.clone());
     atry!(message.write(&mut stream), SendError::Serialization);
     return Ok(());
 }
@@ -411,9 +430,7 @@ fn print_interface(lines: &Dict, interface: &network::Interface) {
 }
 
 //@Refactor: Move file opening and duplicate detection somewhere else?
-fn serve_file(lines: &Dict, path: PathBuf, port: u16) -> Result<(), ServeError> {
-        info!("Serving file: \"{}\"", path.to_str().unwrap());
-
+fn serve_file(lines: &Dict, file: FileInfo, port: u16) -> Result<(), ServeError> {
         let interfaces = atry!(network::interfaces(), ServeError::Enumeration);
 
         let listener = atry!(std::net::TcpListener::bind(("0.0.0.0", port)), | err | ServeError::Bind(err, "0.0.0.0", port));
@@ -425,7 +442,8 @@ fn serve_file(lines: &Dict, path: PathBuf, port: u16) -> Result<(), ServeError> 
 
         for conn in listener.incoming() {
             let mut stream = atry!(conn, ServeError::Connection);
-            atry!(send_file(&mut stream, &path), ServeError::SendingFile);
+
+            atry!(send_file(&mut stream, &file), ServeError::SendingFile);
         }
         return Ok(());
 }
@@ -435,8 +453,8 @@ fn fetch_file(lines: &Dict, key: String, file: Option<std::path::PathBuf>) ->  R
         println!("{} from ip {}",
                  Green.paint("Downloading"),
                  Yellow.paint(ip.to_string()));
-
-        let stream = atry!(std::net::TcpStream::connect((ip, 2222)), | err | FetchError::Connection(err, ip, 2222));//@Expansion: We can't time out right now. Use the net2::TcpBuilder?
+        //@Expansion: We can't time out right now. Use the net2::TcpBuilder?
+        let stream = atry!(std::net::TcpStream::connect((ip, 2222)), | err | FetchError::Connection(err, ip, 2222));
         let mut message = atry!(FileMessage::read(stream), FetchError::ReadMessage);
 
         let mut pb = ProgressBar::new(message.size as u64);
@@ -516,7 +534,10 @@ fn main() {
             .parse()
             .expect("Failed parsing the port number");
 
-        if let Err(err) = serve_file(&lines, path, port) {
+        let file = FileInfo::from_path(path)
+            .expect("Failed opening file");
+
+        if let Err(err) = serve_file(&lines, file, port) {
             println!(" {} {}", Red.paint("==>"), err);
             let mut terr : &std::error::Error = &err;
             while let Some(serr) = terr.cause() {
