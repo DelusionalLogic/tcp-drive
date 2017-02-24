@@ -386,22 +386,23 @@ macro_rules! atry {
 struct FileInfo{
     path: PathBuf,
     len: u64,
-    stream: std::fs::File,
 }
 
 impl FileInfo {
-    fn new(path: PathBuf, len: u64, stream: std::fs::File) -> FileInfo {
+    fn new(path: PathBuf, len: u64) -> FileInfo {
         return FileInfo {
             path: path,
             len: len,
-            stream: stream,
         }
     }
 
     fn from_path(path: PathBuf) -> Result<FileInfo, ServeError> {
-        let file = try!(std::fs::File::open(&path));
         let metadata = try!(std::fs::metadata(&path));
-        return Ok(FileInfo::new(path, metadata.len(), file))
+        return Ok(FileInfo::new(path, metadata.len()))
+    }
+
+    fn open(&self) -> Result<std::fs::File, std::io::Error> {
+        return Ok(try!(std::fs::File::open(&self.path)));
     }
 }
 
@@ -415,7 +416,7 @@ fn send_file<S: Write>(mut stream: &mut S, file: &FileInfo) -> Result<(), SendEr
         None => return Err(SendError::PathConversion),
     };
 
-    let mut message = FileMessage::new(filename, file.len as u32, file.stream.clone());
+    let mut message = FileMessage::new(filename, file.len as u32, try!(file.open()));
     atry!(message.write(&mut stream), SendError::Serialization);
     return Ok(());
 }
@@ -456,6 +457,7 @@ fn fetch_file(lines: &Dict, key: String, file: Option<std::path::PathBuf>) ->  R
         //@Expansion: We can't time out right now. Use the net2::TcpBuilder?
         let stream = atry!(std::net::TcpStream::connect((ip, 2222)), | err | FetchError::Connection(err, ip, 2222));
         let mut message = atry!(FileMessage::read(stream), FetchError::ReadMessage);
+
 
         let mut pb = ProgressBar::new(message.size as u64);
         pb.set_units(Units::Bytes);
