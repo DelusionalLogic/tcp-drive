@@ -7,11 +7,9 @@ extern crate pbr;
 #[macro_use]
 extern crate send;
 
-mod errors;
 mod network;
 
 use std::path::PathBuf;
-use errors::*;
 use clap::App;
 use clap::SubCommand;
 use clap::Arg;
@@ -20,18 +18,18 @@ use std::io;
 use std::fmt;
 use ansi_term::Colour::*;
 use send::Transportable;
+use send::TransportPresenter;
+use send::errors::*;
 
 #[derive(Debug)]
 pub enum AppError {
     Io(io::Error),
-    Serve(ServeError),
 }
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             AppError::Io(_) => write!(f, "An IO error occured"),
-            AppError::Serve(_) => write!(f, "An error occured while serving file"),
         }
     }
 }
@@ -40,14 +38,12 @@ impl Error for AppError {
     fn description(&self) -> &str {
         match *self {
             AppError::Io(ref err) => err.description(),
-            AppError::Serve(_) => "An error occured during file serving",
         }
     }
 
     fn cause(&self) -> Option<&Error> {
         match *self {
             AppError::Io(ref err) => Some(err),
-            AppError::Serve(ref err) => Some(err),
         }
     }
 }
@@ -58,12 +54,12 @@ impl From<io::Error> for AppError {
     }
 }
 
-fn print_interface(lines: &send::Dict, interface: &network::Interface) {
+fn print_interface(presenter: &TransportPresenter, interface: &network::Interface) {
     println!("{}[{}]\n {} {}",
              Green.paint(interface.name.to_string()),
              Yellow.paint(interface.addr.to_string()),
              Blue.paint("=>"),
-             interface.addr.make_transport(&lines)
+             presenter.present(&interface.addr).unwrap()
             );
 }
 
@@ -109,7 +105,8 @@ fn main() {
                         )
                     ).get_matches();
 
-    let glob_lines: send::Dict<'static> = make_list();
+    let (glob_lines, glob_count) = make_list();
+    let presenter = TransportPresenter::new(glob_lines, glob_count);
 
     if let Some(matches) = matches.subcommand_matches("serve") {
         //We know that file has to be provided
@@ -129,9 +126,9 @@ fn main() {
         let interfaces = network::interfaces().unwrap();
         for interface in &interfaces {
             info!("Interface: {}", interface.name);
-            print_interface(&glob_lines, &interface);
+            print_interface(&presenter, &interface);
         }
-        if let Err(err) = send::serve_file(&glob_lines, file, port) {
+        if let Err(err) = send::serve_file(file, port) {
             println!(" {} {}", Red.paint("==>"), err);
             let mut terr : &std::error::Error = &err;
             while let Some(serr) = terr.cause() {
@@ -147,7 +144,7 @@ fn main() {
         let new_path = matches.value_of("file")
             .map(| path | std::path::PathBuf::from(path));
 
-        if let Err(err) = send::fetch_file(&glob_lines, key, new_path) {
+        if let Err(err) = send::fetch_file(presenter, key, new_path) {
             println!(" {} {}", Red.paint("==>"), err);
             let mut terr : &std::error::Error = &err;
             while let Some(serr) = terr.cause() {

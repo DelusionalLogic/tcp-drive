@@ -29,11 +29,10 @@ fn main() {
     let words = read_into_vector("./newwords.txt");
 
     f.write_all(b"
-    fn make_list() -> Box<[&'static str]> {
-        return Box::new([");
+    fn make_list() -> (Box<[&'static str]>, u32) {
+        return (Box::new([");
     for word in &words {
         write!(f, "\"{}\",\n", word).unwrap();
     }
-    f.write_all(b"
-    ]);}");
+    write!(f, "]), {});}}", words.len());
 }
