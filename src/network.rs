@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use std::mem;
 use std::io;
 use std::ffi;
+use std::cmp;
 
 #[derive(Debug)]
 pub enum NetworkError {
@@ -55,9 +56,17 @@ impl From<ffi::IntoStringError> for NetworkError {
     }
 }
 
+#[derive(Eq)]
+#[derive(Hash)]
 pub struct Interface {
     pub name : String,
     pub addr : Ipv4Addr,
+}
+
+impl cmp::PartialEq for Interface {
+    fn eq(&self, other: &Interface) -> bool {
+        return self.name == other.name && self.addr == other.addr;
+    }
 }
 
 pub fn interfaces() -> Result<Vec<Interface>, NetworkError> {

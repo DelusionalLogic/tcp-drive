@@ -7,8 +7,6 @@ extern crate pbr;
 #[macro_use]
 extern crate send;
 
-mod network;
-
 use std::path::PathBuf;
 use clap::App;
 use clap::SubCommand;
@@ -16,9 +14,12 @@ use clap::Arg;
 use std::error::Error;
 use std::io;
 use std::fmt;
+use std::sync::Mutex;
+use std::collections::HashMap;
 use ansi_term::Colour::*;
 use send::Transportable;
 use send::TransportPresenter;
+use send::FileRepository;
 use send::errors::*;
 
 #[derive(Debug)]
@@ -54,13 +55,13 @@ impl From<io::Error> for AppError {
     }
 }
 
-fn print_interface(presenter: &TransportPresenter, interface: &network::Interface) {
-    println!("{}[{}]\n {} {}",
-             Green.paint(interface.name.to_string()),
-             Yellow.paint(interface.addr.to_string()),
-             Blue.paint("=>"),
-             presenter.present(&interface.addr).unwrap()
-            );
+fn print_err<T: std::fmt::Display + std::error::Error>(err: T) {
+    println!(" {} {}", Red.paint("==>"), err);
+    let mut terr : &std::error::Error = &err;
+    while let Some(serr) = terr.cause() {
+        println!("    {} {}", Yellow.paint("==>"), serr);
+        terr = serr;
+    }
 }
 
 //@Refactor: Move file opening and duplicate detection somewhere else?
@@ -112,29 +113,42 @@ fn main() {
         //We know that file has to be provided
         let path = PathBuf::from(matches.value_of("file").unwrap());
 
-        //@Error: Write something better
-        let port : u16 = matches
-            .value_of("port")
-            .unwrap_or("2222")
-            .parse()
-            .expect("Failed parsing the port number");
-
         let file = send::FileInfo::from_path(path)
             .expect("Failed opening file");
 
 
-        let interfaces = network::interfaces().unwrap();
-        for interface in &interfaces {
+        let interfaces = send::network::interfaces().unwrap();
+        let mut thread = Vec::with_capacity(interfaces.len());
+
+        let mut imap = HashMap::new();
+        for interface in interfaces {
             info!("Interface: {}", interface.name);
-            print_interface(&presenter, &interface);
+            let repo = send::FileRepository::new(interface);
+            let key = repo.interface.name.clone();
+            let repo_ref = Mutex::new(repo);
+            imap.insert(key, repo_ref);
         }
-        if let Err(err) = send::serve_file(file, port) {
-            println!(" {} {}", Red.paint("==>"), err);
-            let mut terr : &std::error::Error = &err;
-            while let Some(serr) = terr.cause() {
-                println!("    {} {}", Yellow.paint("==>"), serr);
-                terr = serr;
+
+        for (key, repo_ref) in imap {
+            {
+                let mut repo = repo_ref.lock().unwrap();
+                let transport = repo.add_file(file.clone()).unwrap();
+                println!("{}\n {} {}",
+                         Yellow.paint(key.to_string()),
+                         Blue.paint("=>"),
+                         presenter.present(&transport).unwrap()
+                        );
             }
+            thread.push(std::thread::spawn(move || {
+                let repo = repo_ref.lock().unwrap();
+                if let Err(err) = repo.run() {
+                    print_err(err)
+                }
+            }));
+        }
+
+        for t in thread {
+            t.join().unwrap();
         }
     } else if let Some(matches) = matches.subcommand_matches("fetch") {
         //There has to be a key for the commandline to be valid so just unwrap
@@ -145,12 +159,7 @@ fn main() {
             .map(| path | std::path::PathBuf::from(path));
 
         if let Err(err) = send::fetch_file(presenter, key, new_path) {
-            println!(" {} {}", Red.paint("==>"), err);
-            let mut terr : &std::error::Error = &err;
-            while let Some(serr) = terr.cause() {
-                println!("    {} {}", Yellow.paint("==>"), serr);
-                terr = serr;
-            }
+            print_err(err);
         }
     }
     return;

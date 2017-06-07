@@ -14,7 +14,7 @@ extern crate byteorder;
 extern crate ansi_term;
 extern crate pbr;
 
-mod network;
+pub mod network;
 
 use std::path::PathBuf;
 use std::io::{Read, Write};
@@ -24,12 +24,8 @@ use std::cmp::Ordering;
 use pbr::{ProgressBar, Units};
 
 pub mod errors {
-    use std::error;
-    use network;
     use std::io;
-    use std::fmt;
     use std::net;
-    use std::path;
     error_chain! {
         // The type defined for this error. These are the conventional
         // and recommended names, but they can be arbitrarily chosen.
@@ -95,7 +91,7 @@ pub mod errors {
                 description("While enumerating interface")
                 display("While enumerating interfaces")
             }
-            Bind(ip: &'static str, port: u16) {
+            Bind(ip: net::Ipv4Addr, port: u16) {
                 description("While binding connection")
                 display("While binding to {}:{}", ip, port)
             }
@@ -213,19 +209,15 @@ impl<'a> TransportPresenter<'a> {
         };
     }
 
-    pub fn present(&self, t: &Transportable) -> Result<String> {
-        let transport = t.make_transport_context()
-            .chain_err(|| "While making transport")?;
-        print!("State: {}, max_state: {}, dict_entries: {}\n", transport.state, transport.max_state, self.dict_entries);
-        let parts = (transport.max_state as f64).log(self.dict_entries as f64).ceil() as u32;
+    pub fn present(&self, t: &Transport) -> Result<String> {
+        let parts = (t.max_state as f64).log(self.dict_entries as f64).ceil() as u32;
 
         let mut part_representation: Vec<&str> = Vec::with_capacity(parts as usize);
 
-        let mut remainder = transport.state;
+        let mut remainder = t.state;
         for _ in 0..parts {
             let part = remainder % self.dict_entries;
             remainder = remainder / self.dict_entries;
-            print!("Part: {}\n", part);
             part_representation.push(self.dictionary[part as usize]);
         }
         return Ok(part_representation.join(" "));
@@ -309,6 +301,7 @@ impl Transportable for std::net::Ipv4Addr {
     }
 }
 
+#[derive(Clone)]
 pub struct FileInfo{
     path: PathBuf,
     len: u64,
@@ -346,16 +339,36 @@ fn send_file<S: Write>(mut stream: &mut S, file: &FileInfo) -> Result<()> {
     return Ok(());
 }
 
-pub fn serve_file(file: FileInfo, port: u16) -> Result<()> {
-        let listener = std::net::TcpListener::bind(("0.0.0.0", port))
-            .chain_err(|| ErrorKind::Bind("0.0.0.0", port))?;
+pub struct FileRepository {
+    files: std::collections::HashMap<u32, FileInfo>,
+    pub interface: network::Interface,
+    next_id: u32,
+}
+
+impl FileRepository {
+    pub fn new(interface: network::Interface) -> Self {
+        return FileRepository {
+            files: std::collections::HashMap::new(),
+            interface: interface,
+            next_id: 0,
+        };
+    }
+
+    pub fn add_file(&mut self, file: FileInfo) -> Result<Transport> {
+        self.files.insert(self.next_id, file);
+        return self.interface.addr.make_transport_context();
+    }
+
+    pub fn run(&self) -> Result<()> {
+        let listener = std::net::TcpListener::bind((self.interface.addr, 2222))
+            .chain_err(|| ErrorKind::Bind(self.interface.addr, 2222))?;
 
         for conn in listener.incoming() {
             let mut stream = conn.chain_err(|| ErrorKind::ServerConnection)?;
-
-            send_file(&mut stream, &file);
+            send_file(&mut stream, self.files.get(&0).unwrap());
         }
         return Ok(());
+    }
 }
 
 pub fn fetch_file(presenter: TransportPresenter, key: String, file: Option<std::path::PathBuf>) ->  Result<()> {
