@@ -4,7 +4,6 @@ extern crate clap;
 extern crate byteorder;
 extern crate ansi_term;
 extern crate pbr;
-#[macro_use]
 extern crate send;
 
 use std::path::PathBuf;
@@ -17,10 +16,6 @@ use std::fmt;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use ansi_term::Colour::*;
-use send::Transportable;
-use send::TransportPresenter;
-use send::FileRepository;
-use send::errors::*;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -107,7 +102,7 @@ fn main() {
                     ).get_matches();
 
     let (glob_lines, glob_count) = make_list();
-    let presenter = TransportPresenter::new(glob_lines, glob_count);
+    let presenter = send::TransportPresenter::new(glob_lines, glob_count);
 
     if let Some(matches) = matches.subcommand_matches("serve") {
         //We know that file has to be provided
@@ -158,9 +153,14 @@ fn main() {
         let new_path = matches.value_of("file")
             .map(| path | std::path::PathBuf::from(path));
 
-        if let Err(err) = send::fetch_file(presenter, key, new_path) {
-            print_err(err);
-        }
+        let transport = presenter.present_inv(key).unwrap();
+        let client = send::FileClient::new();
+
+        client.get_file(transport, new_path).unwrap();
+
+        // if let Err(err) = send::fetch_file(presenter, transport, new_path) {
+        //     print_err(err);
+        // }
     }
     return;
 }

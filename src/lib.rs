@@ -26,6 +26,7 @@ use pbr::{ProgressBar, Units};
 pub mod errors {
     use std::io;
     use std::net;
+    use std::path;
     error_chain! {
         // The type defined for this error. These are the conventional
         // and recommended names, but they can be arbitrarily chosen.
@@ -78,6 +79,15 @@ pub mod errors {
             Serialization {
                 description("Serialization failed")
                 display("Failed serializing")
+            }
+            //I think cloning the pathbuf is ok for the slow path in case of error
+            SendFile(remote_addr: net::SocketAddr){
+                description("Error while sending file")
+                display("While sending to {}", remote_addr)
+            }
+            UnknownFile(index: u32) {
+                description("The client requested an unknown file")
+                display("The client requested an unknown file with id {}", index)
             }
             ServerConnection {
                 description("While processing connection")
@@ -210,11 +220,11 @@ impl<'a> TransportPresenter<'a> {
     }
 
     pub fn present(&self, t: &Transport) -> Result<String> {
-        let parts = (t.max_state as f64).log(self.dict_entries as f64).ceil() as u32;
+        let parts = (t.max_state() as f64).log(self.dict_entries as f64).ceil() as u32;
 
         let mut part_representation: Vec<&str> = Vec::with_capacity(parts as usize);
 
-        let mut remainder = t.state;
+        let mut remainder = t.state();
         for _ in 0..parts {
             let part = remainder % self.dict_entries;
             remainder = remainder / self.dict_entries;
@@ -223,7 +233,7 @@ impl<'a> TransportPresenter<'a> {
         return Ok(part_representation.join(" "));
     }
 
-    pub fn present_inv<T: Transportable>(&self, s: String) -> Result<T> {
+    pub fn present_inv(&self, s: String) -> Result<ClientTransport> {
         let mut res:  u32 = 0;
         let mut part_count = 0;
         for word in s.split(" ") {
@@ -241,63 +251,79 @@ impl<'a> TransportPresenter<'a> {
                 bail!(ErrorKind::InvalidTransport(word.to_owned()));
             }
         }
-        return T::from_transport_s(res);
+        return Ok(ClientTransport::new(res));
     }
 }
 
-pub struct Transport {
+pub struct ServerTransport {
     state: u32,
     max_state: u32,
 }
 
+pub struct ClientTransport {
+    state: u32,
+}
+
+pub trait Transport {
+    fn state(&self) -> u32;
+    fn max_state(&self) -> u32;
+}
+
+impl ServerTransport {
+    fn new(state: u32, max_state: u32) -> Self {
+        return ServerTransport {
+            state: state,
+            max_state: max_state,
+        };
+    }
+}
+
+impl Transport for ServerTransport {
+    fn state(&self) -> u32 {
+        return self.state;
+    }
+
+    fn max_state(&self) -> u32 {
+        return self.max_state;
+    }
+}
+
+pub trait PartialTransport {
+    fn state(&self) -> u32;
+}
+
+impl ClientTransport {
+    fn new(state: u32) -> Self {
+        return ClientTransport {
+            state: state,
+        };
+    }
+}
+
+impl PartialTransport for ClientTransport {
+    fn state(&self) -> u32 {
+        return self.state;
+    }
+}
+
+impl <T: Transport> PartialTransport for T {
+    fn state(&self) -> u32 {
+        return Transport::state(self);
+    }
+}
+
 pub trait Transportable {
-    fn make_transport_context(&self) -> Result<Transport>;
-    fn from_transport_s(t: u32) -> Result<Self> where Self: std::marker::Sized;
-    fn make_transport(&self, dict: &Dict) -> String;
-    fn from_transport<'a, S: Into<&'a String>>(dict: &Dict, transport: S) -> Result<Self>
-        where Self: std::marker::Sized;
+    fn make_transport(&self) -> Result<ServerTransport>;
+    fn from_transport<T: PartialTransport>(t: T) -> Result<Self> where Self: std::marker::Sized;
 }
 
 impl Transportable for std::net::Ipv4Addr {
-    fn make_transport_context(&self) -> Result<Transport> {
-        return Ok(Transport {
-            state: u32::from(self.clone()),
-            max_state: std::u32::MAX,
-        })
-    }
-    fn from_transport_s(t: u32) -> Result<Self> {
-        return Ok(std::net::Ipv4Addr::from(t));
-    }
-    fn make_transport(&self, dict: &Dict) -> String {
-        let transport = self.octets()
-            .chunks(2)
-            .map(| item | item[1] as u16 | (item[0] as u16) << 8) //@Expansion: We only support 2 bytes per word here
-            .map(| i | dict[i as usize].to_owned()) //@Hack: Can we do this without owned?
-            .collect::<Vec<_>>()
-            .join(" ");
-        return transport
+    fn make_transport(&self) -> Result<ServerTransport> {
+        return Ok(ServerTransport::new(u32::from(self.clone()), std::u32::MAX));
     }
 
-    fn from_transport<'a, S: Into<&'a String>>(dict: &Dict, transport: S) -> Result<Self> {
-        let transport : &String = transport.into();
-        let mut ip_vec = Vec::new();
-
-        for word in transport.split(" ") {
-            if let Ok(val) = dict.binary_search_by(|p| {
-                    //Flip the search to allow for cmp between String and &str
-                    match word.cmp(p) {
-                        Ordering::Greater => Ordering::Less,
-                        Ordering::Less => Ordering::Greater,
-                        Ordering::Equal => Ordering::Equal,
-                    }
-                }) {
-                ip_vec.push(val as u32);
-            } else {
-                bail!(ErrorKind::InvalidTransport(word.to_owned()));
-            }
-        }
-
-        return Ok(std::net::Ipv4Addr::from(ip_vec[1] |  ip_vec[0] << 16));
+    fn from_transport<T: PartialTransport>(t: T) -> Result<Self> {
+        return Ok(std::net::Ipv4Addr::from(t.state()));
     }
 }
 
@@ -325,6 +351,7 @@ impl FileInfo {
     }
 }
 
+//@Refactor: This is just private but should be refactored
 fn send_file<S: Write>(mut stream: &mut S, file: &FileInfo) -> Result<()> {
     let filename = match file.path.file_name()
         .and_then(|x| x.to_str())
@@ -354,58 +381,80 @@ impl FileRepository {
         };
     }
 
-    pub fn add_file(&mut self, file: FileInfo) -> Result<Transport> {
+    pub fn add_file(&mut self, file: FileInfo) -> Result<ServerTransport> {
         self.files.insert(self.next_id, file);
-        return self.interface.addr.make_transport_context();
+        return self.interface.addr.make_transport();
+    }
+
+    fn get_file(&self, index: u32) -> Result<&FileInfo> {
+        return self.files.get(&index)
+            .ok_or_else(|| ErrorKind::UnknownFile(index).into());
     }
 
     pub fn run(&self) -> Result<()> {
+        //@Expansion: Maybe don't use fixed ports
         let listener = std::net::TcpListener::bind((self.interface.addr, 2222))
             .chain_err(|| ErrorKind::Bind(self.interface.addr, 2222))?;
 
         for conn in listener.incoming() {
-            let mut stream = conn.chain_err(|| ErrorKind::ServerConnection)?;
-            send_file(&mut stream, self.files.get(&0).unwrap());
+            let mut stream = conn
+                .chain_err(|| ErrorKind::ServerConnection)?;
+            //TODO: I should read some sort of info about which file to get here
+            let file = self.get_file(0)
+                .chain_err(|| ErrorKind::SendFile(stream.peer_addr().unwrap()))?;
+            send_file(&mut stream, file)
+                .chain_err(|| ErrorKind::SendFile(stream.peer_addr().unwrap()))?;
         }
         return Ok(());
     }
 }
 
-pub fn fetch_file(presenter: TransportPresenter, key: String, file: Option<std::path::PathBuf>) ->  Result<()> {
-    let ip: std::net::Ipv4Addr = presenter.present_inv(key).unwrap();
-    println!("{} from ip {}",
-             Green.paint("Downloading"),
-             Yellow.paint(ip.to_string()));
-    //@Expansion: We can't time out right now. Use the net2::TcpBuilder?
-    let stream = std::net::TcpStream::connect((ip, 2222))
-        .chain_err(|| ErrorKind::ClientConnection(ip, 2222))?;
-    let mut message = FileMessage::read(stream)
-        .chain_err(|| ErrorKind::Fetch)?;
-
-
-    let mut pb = ProgressBar::new(message.size as u64);
-    pb.set_units(Units::Bytes);
-
-    let new_path = file
-        .unwrap_or(std::path::PathBuf::from(&message.name));
-
-    if new_path.exists() {
-        bail!(ErrorKind::FileExists(new_path));
-    }
-
-    let mut file = try!(std::fs::File::create(new_path));
-
-    let mut buffer = [0u8; 8192];
-    loop{
-        let read = message.file.read(&mut buffer)
-            .chain_err(|| ErrorKind::ReadContent)?;
-        if read == 0 {
-            break;
-        }
-        pb.add(read as u64);
-        file.write(&mut buffer[0..read])
-            .chain_err(|| ErrorKind::WriteContent)?;
-    }
-    return Ok(());
+pub struct FileClient {
 }
 
+impl FileClient{
+    pub fn new() -> Self {
+        return FileClient {
+        }
+    }
+
+    pub fn get_file<T: PartialTransport>(&self, transport: T, out_path: Option<std::path::PathBuf>) -> Result<()> {
+        let ip = std::net::Ipv4Addr::from_transport(transport)?;
+        println!("{} from ip {}",
+                 Green.paint("Downloading"),
+                 Yellow.paint(ip.to_string()));
+        //@Expansion: We can't time out right now. Use the net2::TcpBuilder?
+        //@Expansion: Maybe don't use fixed ports
+        let stream = std::net::TcpStream::connect((ip, 2222))
+            .chain_err(|| ErrorKind::ClientConnection(ip, 2222))?;
+        let mut message = FileMessage::read(stream)
+            .chain_err(|| ErrorKind::Fetch)?;
+
+
+        let mut pb = ProgressBar::new(message.size as u64);
+        pb.set_units(Units::Bytes);
+
+        let new_path = out_path
+            .unwrap_or(std::path::PathBuf::from(&message.name));
+
+        if new_path.exists() {
+            bail!(ErrorKind::FileExists(new_path));
+        }
+
+        //TODO: Make some error wrapper
+        let mut file = std::fs::File::create(new_path)?;
+
+        let mut buffer = [0u8; 8192];
+        loop{
+            let read = message.file.read(&mut buffer)
+                .chain_err(|| ErrorKind::ReadContent)?;
+            if read == 0 {
+                break;
+            }
+            pb.add(read as u64);
+            file.write(&mut buffer[0..read])
+                .chain_err(|| ErrorKind::WriteContent)?;
+        }
+        return Ok(());
+    }
+}
